@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import io
 import os
+import base64
 import datetime
 from openpyxl import Workbook
 from openpyxl.styles import (Font, PatternFill, Alignment, Border, Side,
@@ -634,13 +635,20 @@ if uploaded_files:
                 st.session_state["_wb_filename"] = f"{safe_name}.xlsx"
 
         if "_wb_bytes" in st.session_state:
-            st.download_button(
-                label=f"Download {st.session_state['_wb_filename']}",
-                data=st.session_state["_wb_bytes"],
-                file_name=st.session_state["_wb_filename"],
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                type="primary",
-                use_container_width=True
+            b64 = base64.b64encode(st.session_state["_wb_bytes"]).decode()
+            fname = st.session_state["_wb_filename"]
+            mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            st.markdown(
+                f"""
+                <a href="data:{mime};base64,{b64}" download="{fname}"
+                   style="display:block;width:100%;padding:0.6rem 1rem;
+                          background:#FF4B4B;color:white;text-align:center;
+                          font-weight:600;font-size:1rem;border-radius:0.5rem;
+                          text-decoration:none;">
+                    ⬇ Download {fname}
+                </a>
+                """,
+                unsafe_allow_html=True,
             )
             st.success(
                 f"Workbook ready — {len(timesheets)} engineer(s) across 6 sheets "
