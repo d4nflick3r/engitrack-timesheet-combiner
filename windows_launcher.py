@@ -14,6 +14,4 @@ start_desktop_app(
     title="EngiTrack Timesheet Combiner",
     width=1400,
     height=900,
-    min_width=900,
-    min_height=600,
 )
