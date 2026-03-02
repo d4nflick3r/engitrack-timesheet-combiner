@@ -618,20 +618,26 @@ if uploaded_files:
                 help="Name for the downloaded Excel workbook (no extension needed)"
             )
 
+        current_file_key = tuple(sorted(f.name for f in uploaded_files))
+        if st.session_state.get("_wb_file_key") != current_file_key:
+            st.session_state.pop("_wb_bytes", None)
+            st.session_state.pop("_wb_filename", None)
+            st.session_state["_wb_file_key"] = current_file_key
+
         if st.button("Combine into Excel Workbook", type="primary", use_container_width=True):
             with st.spinner("Building workbook..."):
                 wb = build_workbook(timesheets)
                 buffer = io.BytesIO()
                 wb.save(buffer)
-                buffer.seek(0)
+                safe_name = workbook_name.strip().replace(" ", "_") or "EngiTrack_Combined"
+                st.session_state["_wb_bytes"] = buffer.getvalue()
+                st.session_state["_wb_filename"] = f"{safe_name}.xlsx"
 
-            safe_name = workbook_name.strip().replace(" ", "_") or "EngiTrack_Combined"
-            download_filename = f"{safe_name}.xlsx"
-
+        if "_wb_bytes" in st.session_state:
             st.download_button(
-                label=f"Download {download_filename}",
-                data=buffer,
-                file_name=download_filename,
+                label=f"Download {st.session_state['_wb_filename']}",
+                data=st.session_state["_wb_bytes"],
+                file_name=st.session_state["_wb_filename"],
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 type="primary",
                 use_container_width=True
