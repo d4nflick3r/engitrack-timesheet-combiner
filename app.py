@@ -2,8 +2,11 @@ import streamlit as st
 import pandas as pd
 import io
 import os
+import sys
 import base64
 import datetime
+import subprocess
+from pathlib import Path
 from openpyxl import Workbook
 from openpyxl.styles import (Font, PatternFill, Alignment, Border, Side,
                               GradientFill)
@@ -635,25 +638,41 @@ if uploaded_files:
                 st.session_state["_wb_filename"] = f"{safe_name}.xlsx"
 
         if "_wb_bytes" in st.session_state:
-            b64 = base64.b64encode(st.session_state["_wb_bytes"]).decode()
+            wb_bytes = st.session_state["_wb_bytes"]
             fname = st.session_state["_wb_filename"]
-            mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            st.markdown(
-                f"""
-                <a href="data:{mime};base64,{b64}" download="{fname}"
-                   style="display:block;width:100%;padding:0.6rem 1rem;
-                          background:#FF4B4B;color:white;text-align:center;
-                          font-weight:600;font-size:1rem;border-radius:0.5rem;
-                          text-decoration:none;">
-                    ⬇ Download {fname}
-                </a>
-                """,
-                unsafe_allow_html=True,
-            )
-            st.success(
-                f"Workbook ready — {len(timesheets)} engineer(s) across 6 sheets "
-                f"(Instructions, Engineer_List, Week_List, Weekly_Summary, WeeklyData, DailyData)."
-            )
+
+            if getattr(sys, "frozen", False):
+                downloads_dir = Path.home() / "Downloads"
+                downloads_dir.mkdir(parents=True, exist_ok=True)
+                output_path = downloads_dir / fname
+                output_path.write_bytes(wb_bytes)
+                st.success(
+                    f"Workbook saved to your Downloads folder:\n\n"
+                    f"**{output_path}**"
+                )
+                if st.button("Open file location", key="open_folder"):
+                    subprocess.Popen(
+                        ["explorer", "/select,", str(output_path)]
+                    )
+            else:
+                b64 = base64.b64encode(wb_bytes).decode()
+                mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                st.markdown(
+                    f"""
+                    <a href="data:{mime};base64,{b64}" download="{fname}"
+                       style="display:block;width:100%;padding:0.6rem 1rem;
+                              background:#FF4B4B;color:white;text-align:center;
+                              font-weight:600;font-size:1rem;border-radius:0.5rem;
+                              text-decoration:none;">
+                        ⬇ Download {fname}
+                    </a>
+                    """,
+                    unsafe_allow_html=True,
+                )
+                st.success(
+                    f"Workbook ready — {len(timesheets)} engineer(s) across 6 sheets "
+                    f"(Instructions, Engineer_List, Week_List, Weekly_Summary, WeeklyData, DailyData)."
+                )
 
 else:
     st.info("Upload your EngiTrack CSV timesheet files above to get started.")
