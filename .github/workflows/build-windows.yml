@@ -1,0 +1,37 @@
+name: Build Windows App
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install streamlit openpyxl pandas pillow streamlit-desktop-app pywebview pyinstaller
+      - name: Build Windows executable
+        run: |
+          streamlit-desktop-app build windows_launcher.py `
+            --name "EngiTrack" `
+            --icon windows/engitrack.ico `
+            --pyinstaller-options --onefile --noconfirm --windowed
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: EngiTrack-Windows
+          path: dist/EngiTrack.exe
+          retention-days: 30
+      - name: Create Release (on tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/EngiTrack.exe
+          name: EngiTrack ${{ github.ref_name }}
+          body: |
+            Download EngiTrack.exe and run on Windows 10/11. No Python required.
