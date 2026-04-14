@@ -63,7 +63,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("EngiTrack Timesheet Combiner")
-st.markdown("Upload up to **100 engineer timesheet CSVs** from your EngiTrack app to combine them into a single Excel workbook.")
+st.markdown("Upload your EngiTrack timesheet CSVs — up to **100 weeks per engineer**, any number of engineers.")
 
 st.divider()
 
@@ -251,7 +251,7 @@ def _build_instructions(wb):
     ws.sheet_view.showGridLines = False
 
     lines = [
-        ("EngiTrack Weekly Timesheet Combiner — up to 100 engineers", True, 14, NAV, WHITE),
+        ("EngiTrack Weekly Timesheet Combiner — up to 100 weeks per engineer, unlimited engineers", True, 14, NAV, WHITE),
         ("", False, 11, WHITE, "000000"),
         ("How to use", True, 12, MID, WHITE),
         ("1)  Upload your EngiTrack weekly CSV exports in the app above.", False, 11, GREY, "000000"),
@@ -291,7 +291,7 @@ def _build_engineer_list(wb, timesheets):
         if name not in seen:
             seen.append(name)
 
-    for i, name in enumerate(seen[:100], 2):
+    for i, name in enumerate(seen, 2):
         c = ws.cell(row=i, column=1, value=name)
         c.font = Font(name="Calibri", size=10)
         c.alignment = Alignment(horizontal="left", vertical="center")
@@ -781,13 +781,10 @@ uploaded_files = st.file_uploader(
     "Select timesheet CSV files",
     type=["csv"],
     accept_multiple_files=True,
-    help="Select all the EngiTrack CSV timesheets you want to combine (max 100 files)"
+    help="Select all your EngiTrack CSV timesheets — up to 100 weeks per engineer, any number of engineers"
 )
 
 if uploaded_files:
-    if len(uploaded_files) > 100:
-        st.error(f"Too many files selected ({len(uploaded_files)}). Please select a maximum of 100 timesheets.")
-        st.stop()
 
     timesheets = []
     sheet_errors = []
@@ -901,7 +898,7 @@ else:
     st.info("Upload your EngiTrack CSV timesheet files above to get started.")
     st.markdown("""
     **How it works:**
-    1. Upload your EngiTrack CSV files (up to 100)
+    1. Upload your EngiTrack CSV files (up to 100 weeks per engineer, any number of engineers)
     2. Check the preview — each tab shows an engineer's hours summary and daily breakdown
     3. Click **Combine into Excel Workbook** to generate the workbook
     4. Open **Weekly_Summary** in the downloaded file and pick any week to see all engineers at a glance
