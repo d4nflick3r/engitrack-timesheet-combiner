@@ -1,21 +1,16 @@
 import streamlit as st
-import pandas as pd
 import io
 import os
 import sys
 import base64
 import datetime
-import subprocess
 from pathlib import Path
+from collections import defaultdict
 from openpyxl import Workbook
-from openpyxl.styles import (Font, PatternFill, Alignment, Border, Side,
-                              GradientFill)
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
-from openpyxl.styles.numbers import FORMAT_DATE_DDMMYY
 
-# ── Patch Streamlit's index.html to embed manifest link in raw HTML ───────────
-# This runs once per Streamlit session restart, before any page is served.
-# It is idempotent and resilient to package reinstalls.
+# ── PWA patch (keeps the hosted web-app manifest working) ────────────────────
 try:
     import patch_pwa
     patch_pwa.patch()
@@ -25,1026 +20,383 @@ except Exception:
 st.set_page_config(
     page_title="EngiTrack Timesheet Combiner",
     page_icon="📋",
-    layout="wide"
+    layout="wide",
 )
 
-# ── Service Worker registration (blob URL so it can claim root scope) ─────────
-st.markdown("""
-<script>
-(function () {
-  var SW_CODE = [
-    'var CACHE="engitrack-v2";',
-    'self.addEventListener("install",function(e){self.skipWaiting();});',
-    'self.addEventListener("activate",function(e){',
-    '  e.waitUntil(caches.keys().then(function(ks){',
-    '    return Promise.all(ks.filter(function(k){return k!==CACHE;}).map(function(k){return caches.delete(k);}));',
-    '  }));',
-    '  return self.clients.claim();',
-    '});',
-    'self.addEventListener("fetch",function(e){',
-    '  if(e.request.method!=="GET")return;',
-    '  e.respondWith(fetch(e.request).catch(function(){',
-    '    return new Response("Offline \u2013 please reconnect.",{status:503,headers:{"Content-Type":"text/plain"}});',
-    '  }));',
-    '});'
-  ].join("\\n");
-
-  if ("serviceWorker" in navigator) {
-    try {
-      var blob = new Blob([SW_CODE], { type:"application/javascript" });
-      var swUrl = URL.createObjectURL(blob);
-      navigator.serviceWorker.register(swUrl, { scope:"/" })
-        .then(function(){ console.log("EngiTrack SW registered"); })
-        .catch(function(err){ console.log("EngiTrack SW:", err.message); });
-    } catch(e) { console.log("SW setup:", e); }
-  }
-})();
-</script>
-""", unsafe_allow_html=True)
-
 st.title("EngiTrack Timesheet Combiner")
-st.markdown("Upload your EngiTrack timesheet CSVs — up to **100 weeks per engineer**, any number of engineers.")
-
+st.markdown(
+    "Upload **SOSengitrack** weekly CSV exports for one or more engineers. "
+    "The app combines them into a single Excel workbook with **Weekly** and **Monthly** totals."
+)
 st.divider()
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
 
-def to_excel_serial(date_val):
-    """Convert a date to Excel date serial number."""
-    if isinstance(date_val, str):
+# ── CSV Parser ───────────────────────────────────────────────────────────────
+
+def _parse_date(s):
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%d-%m-%Y"):
         try:
-            date_val = datetime.date.fromisoformat(date_val)
+            return datetime.datetime.strptime(s.strip(), fmt).date()
         except Exception:
-            return None
-    if isinstance(date_val, datetime.datetime):
-        date_val = date_val.date()
-    if isinstance(date_val, datetime.date):
-        return (date_val - datetime.date(1899, 12, 30)).days
+            pass
     return None
 
 
-def sanitise_sheet_name(name):
-    for ch in r"/\?*[]:'":
-        name = name.replace(ch, "-")
-    return name[:31].strip()
-
-
-def parse_engitrack_csv(file_obj):
-    """
-    Parse an EngiTrack CSV and return a dict with all extracted fields.
-    Layout:
-      Row 0 : title
-      Row 1 : Engineer, <name>
-      Row 2 : Week Commencing, <date>
-      Row 3 : blank
-      Row 4 : column headers (Date, Day, ...)
-      Row 5-11: daily rows
-      Row 12: blank
-      Row 13: Weekly Totals (label)
-      Row 14+: key,value pairs for totals (some values are multi-line quoted)
-    """
-    import csv as _csv
-
+def parse_csv(file_obj):
+    """Parse a SOSengitrack weekly timesheet CSV and return a data dict."""
     raw = file_obj.read()
     if isinstance(raw, bytes):
-        raw = raw.decode("utf-8", errors="replace")
+        raw = raw.decode("utf-8-sig")
+    lines = raw.splitlines()
 
-    # Use csv.reader so multi-line quoted fields are handled correctly
-    reader = list(_csv.reader(io.StringIO(raw)))
-
-    engineer_name = "Unknown"
-    week_commencing_str = ""
-
-    for row in reader[:5]:
-        if len(row) >= 2:
-            key = row[0].strip().lower()
-            val = row[1].strip()
-            if key == "engineer":
-                engineer_name = val
-            elif key == "week commencing":
-                week_commencing_str = val
-
-    # Parse daily rows (skip 4 header lines, stop at blank or non-date row)
-    daily_df = pd.read_csv(io.StringIO(raw), skiprows=4, on_bad_lines="skip")
-    if "Date" in daily_df.columns:
-        daily_df = daily_df[daily_df["Date"].astype(str).str.match(r"\d{4}-\d{2}-\d{2}")]
-    else:
-        daily_df = daily_df.iloc[:7]
-
-    # Parse weekly totals section using csv.reader rows
-    # (multi-line quoted fields are already merged by csv.reader)
-    totals = {}
-    in_totals = False
-    for row in reader:
-        if not row:
-            continue
-        cell0 = row[0].strip()
-        if cell0.lower() == "weekly totals":
-            in_totals = True
-            continue
-        if not in_totals:
-            continue
-        if len(row) >= 2 and cell0:
-            totals[cell0] = row[1].strip()
-        elif len(row) == 1 and cell0:
-            totals[cell0] = ""
-
-    def safe_float(key, default=0.0):
-        try:
-            return float(totals.get(key, default))
-        except (ValueError, TypeError):
-            return default
-
-    def safe_int(key, default=0):
-        try:
-            return int(float(totals.get(key, default)))
-        except (ValueError, TypeError):
-            return default
-
-    # Count holiday and sick days from daily data
-    holiday_days = 0
-    sick_days = 0
-    if "Holiday" in daily_df.columns:
-        holiday_days = int((daily_df["Holiday"].astype(str).str.strip().str.lower() == "yes").sum())
-    if "Sickness" in daily_df.columns:
-        sick_days = int((daily_df["Sickness"].astype(str).str.strip().str.lower() == "yes").sum())
-
-    return {
-        "engineer_name": engineer_name,
-        "week_commencing_str": week_commencing_str,
-        "total_hours": safe_float("Total Hours"),
-        "standard_hours": safe_float("Standard Hours (Mon-Fri)"),
-        "weekday_ot": safe_float("Weekday Overtime"),
-        "saturday_hours": safe_float("Saturday Hours"),
-        "sunday_hours": safe_float("Sunday Hours"),
-        "bh_hours": safe_float("Bank Holiday Hours"),
-        "holiday_days": holiday_days,
-        "sick_days": sick_days,
-        "repairs_logged": safe_int("Repairs Logged"),
-        "repairs_notes": totals.get("Repairs Notes", ""),
-        "extra_jobs_logged": safe_int("Extra Jobs Logged"),
-        "extra_jobs_notes": totals.get("Extra Jobs Notes", ""),
-        "daily_df": daily_df,
+    data = {
+        "engineer": "",
+        "week_str": "",
+        "week_date": None,
+        "total_hours": 0.0,
+        "standard_hours": 0.0,
+        "weekday_ot": 0.0,
+        "saturday_hours": 0.0,
+        "sunday_hours": 0.0,
+        "bh_hours": 0.0,
+        "sick_days": 0,
+        "repairs": 0,
+        "extra_jobs": 0,
     }
 
+    in_daily = False
+    in_totals = False
 
-# ── Styles ───────────────────────────────────────────────────────────────────
+    for line in lines:
+        s = line.strip()
 
-NAV   = "1F4E79"   # dark navy
-MID   = "2E75B6"   # mid blue
-LIGHT = "D6E4F0"   # light blue row alt
-WHITE = "FFFFFF"
-GOLD  = "FFD700"
-GREY  = "F2F2F2"
-PAY_NAVY = "002060"  # payroll sheet header colour (matches template)
+        # Header fields
+        if s.startswith("Engineer,"):
+            data["engineer"] = s.split(",", 1)[1].strip()
+            continue
+        if s.startswith("Week Commencing,"):
+            wc = s.split(",", 1)[1].strip()
+            data["week_str"] = wc
+            data["week_date"] = _parse_date(wc)
+            continue
 
-def hdr_cell(ws, row, col, value, bg=NAV, fg=WHITE, bold=True, center=True, size=11):
+        # Section markers
+        if s.startswith("Date,Day,"):
+            in_daily = True
+            in_totals = False
+            continue
+        if s == "Weekly Totals":
+            in_daily = False
+            in_totals = True
+            continue
+        if not s:
+            in_daily = False
+            continue
+
+        # Daily data rows — count sick days
+        if in_daily:
+            parts = s.split(",")
+            # Date,Day,Start,End,Total,BankHol,Holiday,Sickness,WeekendWorked
+            if len(parts) >= 8 and parts[7].strip().lower() == "yes":
+                data["sick_days"] += 1
+            continue
+
+        # Weekly totals / repair / extra jobs section
+        if "," in s:
+            key, val = s.split(",", 1)
+            key = key.strip()
+            val = val.strip().strip('"')
+            try:
+                v = float(val)
+            except ValueError:
+                v = 0.0
+            if key == "Total Hours":
+                data["total_hours"] = v
+            elif "Standard Hours" in key:
+                data["standard_hours"] = v
+            elif key == "Weekday Overtime":
+                data["weekday_ot"] = v
+            elif key == "Saturday Hours":
+                data["saturday_hours"] = v
+            elif key == "Sunday Hours":
+                data["sunday_hours"] = v
+            elif key == "Bank Holiday Hours":
+                data["bh_hours"] = v
+            elif key == "Repairs Logged":
+                data["repairs"] = int(v)
+            elif key == "Extra Jobs Logged":
+                data["extra_jobs"] = int(v)
+
+    return data
+
+
+# ── Excel builder ─────────────────────────────────────────────────────────────
+
+_THIN = Side(style="thin", color="000000")
+_BORDER = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
+
+
+def _hdr(ws, row, col, value):
     c = ws.cell(row=row, column=col, value=value)
-    c.font = Font(name="Calibri", bold=bold, color=fg, size=size)
-    c.fill = PatternFill(start_color=bg, end_color=bg, fill_type="solid")
-    c.alignment = Alignment(horizontal="center" if center else "left",
-                            vertical="center", wrap_text=True)
-    c.border = thin_border()
+    c.font = Font(name="Calibri", bold=True, size=11, color="FFFFFF")
+    c.fill = PatternFill(start_color="000000", end_color="000000", fill_type="solid")
+    c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    c.border = _BORDER
     return c
 
 
-def thin_border():
-    s = Side(style="thin", color="BFBFBF")
-    return Border(left=s, right=s, top=s, bottom=s)
-
-
-def data_cell(ws, row, col, value, alt=False, wrap=False, number_format=None):
+def _cell(ws, row, col, value, bold=False, center=True, num_fmt=None):
     c = ws.cell(row=row, column=col, value=value)
-    c.font = Font(name="Calibri", size=10)
-    if alt:
-        c.fill = PatternFill(start_color=LIGHT, end_color=LIGHT, fill_type="solid")
-    c.alignment = Alignment(horizontal="left", vertical="center", wrap_text=wrap)
-    c.border = thin_border()
-    if number_format:
-        c.number_format = number_format
+    c.font = Font(name="Calibri", bold=bold, size=11)
+    c.alignment = Alignment(horizontal="center" if center else "left", vertical="center")
+    c.border = _BORDER
+    if num_fmt:
+        c.number_format = num_fmt
     return c
 
 
-def set_col_width(ws, col_letter, width):
-    ws.column_dimensions[col_letter].width = width
+def _total_cell(ws, row, col, value, center=True):
+    c = _cell(ws, row, col, value, bold=True, center=center)
+    c.fill = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
+    return c
 
 
-# ── Workbook builder ─────────────────────────────────────────────────────────
+WEEKLY_HEADERS = [
+    "Engineer", "Week Commencing",
+    "Total Hours", "Standard Hours", "Weekday OT",
+    "Sat Hours", "Sun Hours", "BH Hours",
+    "Sick Days", "Repairs", "Extra Jobs",
+]
 
-def build_workbook(timesheets):
+MONTHLY_HEADERS = [
+    "Engineer", "Month",
+    "Total Hours", "Standard Hours", "Weekday OT",
+    "Sat Hours", "Sun Hours", "BH Hours",
+    "Sick Days", "Repairs", "Extra Jobs",
+]
+
+NUMERIC_COLS = [
+    "total_hours", "standard_hours", "weekday_ot",
+    "saturday_hours", "sunday_hours", "bh_hours",
+    "sick_days", "repairs", "extra_jobs",
+]
+
+
+def _weekly_row(ts):
+    return [
+        ts["engineer"],
+        ts["week_date"] if ts["week_date"] else ts["week_str"],
+        ts["total_hours"] or None,
+        ts["standard_hours"] or None,
+        ts["weekday_ot"] or None,
+        ts["saturday_hours"] or None,
+        ts["sunday_hours"] or None,
+        ts["bh_hours"] or None,
+        ts["sick_days"] or None,
+        ts["repairs"] or None,
+        ts["extra_jobs"] or None,
+    ]
+
+
+def _set_widths(ws, widths):
+    for i, w in enumerate(widths, 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+
+def build_excel(timesheets):
+    timesheets = sorted(
+        timesheets,
+        key=lambda t: (t["engineer"].lower(), t["week_date"] or datetime.date.min),
+    )
+
     wb = Workbook()
     wb.remove(wb.active)
 
-    _build_instructions(wb)
-    _build_engineer_list(wb, timesheets)
-    _build_week_list(wb, timesheets)
-    _build_payroll_sheet(wb, timesheets)
-    _build_weekly_summary(wb, timesheets)
-    _build_monthly_summary(wb, timesheets)
-    _build_weekly_data(wb, timesheets)
-    _build_monthly_data(wb, timesheets)
-    _build_daily_data(wb, timesheets)
+    # ── Weekly sheet ──────────────────────────────────────────────────────────
+    ws_w = wb.create_sheet("Weekly")
+    ws_w.sheet_view.showGridLines = False
+    ws_w.row_dimensions[1].height = 28
+
+    for col, h in enumerate(WEEKLY_HEADERS, 1):
+        _hdr(ws_w, 1, col, h)
+
+    for r, ts in enumerate(timesheets, 2):
+        row = _weekly_row(ts)
+        for col, val in enumerate(row, 1):
+            fmt = "DD/MM/YYYY" if col == 2 and isinstance(val, datetime.date) else None
+            _cell(ws_w, r, col, val, center=(col > 1), num_fmt=fmt)
+        ws_w.row_dimensions[r].height = 18
+
+    # Total row
+    tr = len(timesheets) + 2
+    _total_cell(ws_w, tr, 1, "TOTAL", center=False)
+    for col in range(2, len(WEEKLY_HEADERS) + 1):
+        vals = [ws_w.cell(row=r, column=col).value for r in range(2, tr)]
+        nums = [v for v in vals if isinstance(v, (int, float))]
+        _total_cell(ws_w, tr, col, round(sum(nums), 2) if nums else None)
+    ws_w.row_dimensions[tr].height = 20
+
+    _set_widths(ws_w, [22, 16, 13, 14, 12, 11, 11, 11, 11, 11, 11])
+    ws_w.freeze_panes = "A2"
+
+    # ── Monthly sheet ─────────────────────────────────────────────────────────
+    ws_m = wb.create_sheet("Monthly")
+    ws_m.sheet_view.showGridLines = False
+    ws_m.row_dimensions[1].height = 28
+
+    for col, h in enumerate(MONTHLY_HEADERS, 1):
+        _hdr(ws_m, 1, col, h)
+
+    # Aggregate by (engineer, year, month)
+    monthly = {}
+    for ts in timesheets:
+        wd = ts["week_date"]
+        if wd:
+            key = (ts["engineer"], wd.year, wd.month)
+            label = wd.strftime("%B %Y")
+        else:
+            key = (ts["engineer"], 0, 0)
+            label = "Unknown"
+
+        if key not in monthly:
+            monthly[key] = {
+                "engineer": ts["engineer"],
+                "label": label,
+                "total_hours": 0.0,
+                "standard_hours": 0.0,
+                "weekday_ot": 0.0,
+                "saturday_hours": 0.0,
+                "sunday_hours": 0.0,
+                "bh_hours": 0.0,
+                "sick_days": 0,
+                "repairs": 0,
+                "extra_jobs": 0,
+            }
+        d = monthly[key]
+        for f in NUMERIC_COLS:
+            d[f] += ts[f]
+
+    sorted_keys = sorted(monthly, key=lambda k: (k[0].lower(), k[1], k[2]))
+
+    for r, key in enumerate(sorted_keys, 2):
+        d = monthly[key]
+        row = [
+            d["engineer"], d["label"],
+            d["total_hours"] or None,
+            d["standard_hours"] or None,
+            d["weekday_ot"] or None,
+            d["saturday_hours"] or None,
+            d["sunday_hours"] or None,
+            d["bh_hours"] or None,
+            d["sick_days"] or None,
+            d["repairs"] or None,
+            d["extra_jobs"] or None,
+        ]
+        for col, val in enumerate(row, 1):
+            _cell(ws_m, r, col, val, center=(col > 1))
+        ws_m.row_dimensions[r].height = 18
+
+    # Total row
+    tr_m = len(sorted_keys) + 2
+    _total_cell(ws_m, tr_m, 1, "TOTAL", center=False)
+    for col in range(2, len(MONTHLY_HEADERS) + 1):
+        vals = [ws_m.cell(row=r, column=col).value for r in range(2, tr_m)]
+        nums = [v for v in vals if isinstance(v, (int, float))]
+        _total_cell(ws_m, tr_m, col, round(sum(nums), 2) if nums else None)
+    ws_m.row_dimensions[tr_m].height = 20
+
+    _set_widths(ws_m, [22, 16, 13, 14, 12, 11, 11, 11, 11, 11, 11])
+    ws_m.freeze_panes = "A2"
 
     return wb
-
-
-def _build_instructions(wb):
-    ws = wb.create_sheet("Instructions")
-    ws.sheet_view.showGridLines = False
-
-    lines = [
-        ("EngiTrack Weekly Timesheet Combiner — up to 100 weeks per engineer, unlimited engineers", True, 14, NAV, WHITE),
-        ("", False, 11, WHITE, "000000"),
-        ("How to use", True, 12, MID, WHITE),
-        ("1)  Upload your EngiTrack weekly CSV exports in the app above.", False, 11, GREY, "000000"),
-        ("2)  Click Combine — the workbook is generated automatically.", False, 11, WHITE, "000000"),
-        ("3)  Open the Payroll sheet for a ready-to-submit payroll table (1.5× OT | Sat 1.5 | Double per week, sick days auto-filled — add payroll numbers and bonuses manually).", False, 11, GREY, "000000"),
-        ("4)  Open Weekly_Summary or Monthly_Summary for totals by week or month.", False, 11, WHITE, "000000"),
-        ("5)  WeeklyData, MonthlyData and DailyData hold raw row-level data for deeper analysis.", False, 11, GREY, "000000"),
-        ("", False, 11, WHITE, "000000"),
-        ("Notes", True, 12, MID, WHITE),
-        ("•  Weekly_Summary groups engineers by week commencing date with column totals.", False, 11, GREY, "000000"),
-        ("•  Monthly_Summary groups engineers by calendar month with column totals.", False, 11, WHITE, "000000"),
-        ("•  WeeklyData holds one row per engineer per week.", False, 11, GREY, "000000"),
-        ("•  MonthlyData holds one row per engineer per calendar month (weeks aggregated).", False, 11, WHITE, "000000"),
-        ("•  DailyData holds one row per day per engineer.", False, 11, GREY, "000000"),
-    ]
-
-    for i, (text, bold, size, bg, fg) in enumerate(lines, 1):
-        c = ws.cell(row=i, column=1, value=text)
-        c.font = Font(name="Calibri", bold=bold, size=size, color=fg)
-        c.fill = PatternFill(start_color=bg, end_color=bg, fill_type="solid")
-        c.alignment = Alignment(horizontal="left", vertical="center", indent=1)
-        ws.row_dimensions[i].height = 20 if text else 8
-
-    set_col_width(ws, "A", 80)
-
-
-def _build_engineer_list(wb, timesheets):
-    ws = wb.create_sheet("Engineer_List")
-    ws.sheet_view.showGridLines = False
-
-    hdr_cell(ws, 1, 1, "Engineer")
-    set_col_width(ws, "A", 30)
-    ws.row_dimensions[1].height = 22
-
-    seen = []
-    for ts in timesheets:
-        name = ts["engineer_name"]
-        if name not in seen:
-            seen.append(name)
-
-    for i, name in enumerate(seen, 2):
-        c = ws.cell(row=i, column=1, value=name)
-        c.font = Font(name="Calibri", size=10)
-        c.alignment = Alignment(horizontal="left", vertical="center")
-        c.border = thin_border()
-        if i % 2 == 0:
-            c.fill = PatternFill(start_color=LIGHT, end_color=LIGHT, fill_type="solid")
-
-
-def _build_week_list(wb, timesheets):
-    ws = wb.create_sheet("Week_List")
-    ws.sheet_view.showGridLines = False
-
-    hdr_cell(ws, 1, 1, "Week Commencing (YYYY-MM-DD)")
-    set_col_width(ws, "A", 30)
-    ws.row_dimensions[1].height = 22
-
-    seen = []
-    for ts in timesheets:
-        wc = ts["week_commencing_str"]
-        if wc and wc not in seen:
-            seen.append(wc)
-    seen.sort()
-
-    for i, wc in enumerate(seen, 2):
-        c = ws.cell(row=i, column=1, value=wc)
-        c.font = Font(name="Calibri", size=10)
-        c.alignment = Alignment(horizontal="left", vertical="center")
-        c.border = thin_border()
-        if i % 2 == 0:
-            c.fill = PatternFill(start_color=LIGHT, end_color=LIGHT, fill_type="solid")
-
-
-def _build_weekly_summary(wb, timesheets):
-    ws = wb.create_sheet("Weekly_Summary")
-    ws.sheet_view.showGridLines = False
-
-    col_headers = ["Engineer", "Total Hours", "Standard Hours", "Weekday OT",
-                   "Sat Hours", "Sun Hours", "BH Hours", "Holiday Days",
-                   "Sick Days", "Repairs", "Extra Jobs"]
-    col_widths   = [28, 13, 16, 13, 11, 11, 11, 14, 11, 10, 11]
-    num_cols = len(col_headers)
-
-    for col_idx, w in enumerate(col_widths, 1):
-        set_col_width(ws, get_column_letter(col_idx), w)
-
-    # Group timesheets by week commencing (preserve insertion order)
-    weeks = {}
-    for ts in timesheets:
-        wc = ts["week_commencing_str"]
-        weeks.setdefault(wc, []).append(ts)
-
-    # Main title
-    ws.merge_cells(f"A1:{get_column_letter(num_cols)}1")
-    c = ws.cell(row=1, column=1, value="Weekly Summary")
-    c.font = Font(name="Calibri", bold=True, size=16, color=WHITE)
-    c.fill = PatternFill(start_color=NAV, end_color=NAV, fill_type="solid")
-    c.alignment = Alignment(horizontal="center", vertical="center")
-    ws.row_dimensions[1].height = 32
-
-    current_row = 2
-
-    for week_idx, (wc_str, week_ts) in enumerate(weeks.items()):
-        # Gap between weeks
-        if week_idx > 0:
-            ws.row_dimensions[current_row].height = 10
-            current_row += 1
-
-        # Week heading row
-        try:
-            wc_date = datetime.date.fromisoformat(wc_str)
-            wc_label = wc_date.strftime("Week commencing  %d %B %Y")
-        except Exception:
-            wc_label = f"Week commencing  {wc_str}"
-
-        ws.merge_cells(f"A{current_row}:{get_column_letter(num_cols)}{current_row}")
-        wh = ws.cell(row=current_row, column=1, value=wc_label)
-        wh.font = Font(name="Calibri", bold=True, size=12, color=WHITE)
-        wh.fill = PatternFill(start_color=MID, end_color=MID, fill_type="solid")
-        wh.alignment = Alignment(horizontal="left", vertical="center", indent=1)
-        wh.border = thin_border()
-        ws.row_dimensions[current_row].height = 26
-        current_row += 1
-
-        # Column headers
-        for col_idx, h in enumerate(col_headers, 1):
-            hdr_cell(ws, current_row, col_idx, h, bg="2E75B6", size=10)
-        ws.row_dimensions[current_row].height = 24
-        data_start_row = current_row + 1
-        current_row += 1
-
-        # Accumulate totals
-        totals = [0.0] * (num_cols - 1)
-
-        # Engineer rows
-        for eng_idx, ts in enumerate(week_ts):
-            alt = (eng_idx % 2 == 0)
-            row_vals = [
-                ts["engineer_name"],
-                ts["total_hours"],
-                ts["standard_hours"],
-                ts["weekday_ot"],
-                ts["saturday_hours"],
-                ts["sunday_hours"],
-                ts["bh_hours"],
-                ts["holiday_days"],
-                ts["sick_days"],
-                ts["repairs_logged"],
-                ts["extra_jobs_logged"],
-            ]
-            for col_idx, val in enumerate(row_vals, 1):
-                c = ws.cell(row=current_row, column=col_idx, value=val)
-                c.font = Font(name="Calibri", size=10,
-                              bold=(col_idx == 1))
-                c.fill = PatternFill(
-                    start_color=LIGHT if alt else WHITE,
-                    end_color=LIGHT if alt else WHITE,
-                    fill_type="solid")
-                c.alignment = Alignment(
-                    horizontal="left" if col_idx == 1 else "center",
-                    vertical="center")
-                c.border = thin_border()
-                if col_idx > 1:
-                    try:
-                        totals[col_idx - 2] += float(val or 0)
-                    except (TypeError, ValueError):
-                        pass
-            ws.row_dimensions[current_row].height = 18
-            current_row += 1
-
-        # Totals row
-        tc = ws.cell(row=current_row, column=1, value="TOTAL")
-        tc.font = Font(name="Calibri", bold=True, size=11, color=WHITE)
-        tc.fill = PatternFill(start_color=NAV, end_color=NAV, fill_type="solid")
-        tc.alignment = Alignment(horizontal="center", vertical="center")
-        tc.border = thin_border()
-
-        for col_idx, total_val in enumerate(totals, 2):
-            display = int(total_val) if total_val == int(total_val) else round(total_val, 2)
-            c = ws.cell(row=current_row, column=col_idx, value=display)
-            c.font = Font(name="Calibri", bold=True, size=11, color=WHITE)
-            c.fill = PatternFill(start_color=NAV, end_color=NAV, fill_type="solid")
-            c.alignment = Alignment(horizontal="center", vertical="center")
-            c.border = thin_border()
-
-        ws.row_dimensions[current_row].height = 22
-        current_row += 1
-
-    ws.freeze_panes = "A2"
-
-
-def _parse_wc_date(wc_str):
-    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%d-%m-%Y"):
-        try:
-            return datetime.datetime.strptime(wc_str.strip(), fmt).date()
-        except (ValueError, AttributeError):
-            continue
-    return None
-
-
-def _build_monthly_summary(wb, timesheets):
-    from collections import defaultdict
-    ws = wb.create_sheet("Monthly_Summary")
-    ws.sheet_view.showGridLines = False
-
-    col_headers = ["Engineer", "Weeks", "Total Hours", "Standard Hours", "Weekday OT",
-                   "Sat Hours", "Sun Hours", "BH Hours", "Holiday Days",
-                   "Sick Days", "Repairs", "Extra Jobs"]
-    col_widths = [28, 8, 13, 16, 13, 11, 11, 11, 14, 11, 10, 11]
-    num_cols = len(col_headers)
-
-    for col_idx, w in enumerate(col_widths, 1):
-        set_col_width(ws, get_column_letter(col_idx), w)
-
-    monthly = defaultdict(lambda: defaultdict(lambda: {
-        "weeks": 0, "month_label": "",
-        "total_hours": 0.0, "standard_hours": 0.0, "weekday_ot": 0.0,
-        "saturday_hours": 0.0, "sunday_hours": 0.0, "bh_hours": 0.0,
-        "holiday_days": 0, "sick_days": 0,
-        "repairs_logged": 0, "extra_jobs_logged": 0,
-    }))
-
-    for ts in timesheets:
-        wc_date = _parse_wc_date(ts["week_commencing_str"])
-        if wc_date:
-            key = (wc_date.year, wc_date.month)
-            label = wc_date.strftime("%B %Y")
-        else:
-            key = (9999, 99)
-            label = f"Unknown ({ts['week_commencing_str']})"
-        e = monthly[key][ts["engineer_name"]]
-        e["weeks"] += 1
-        e["month_label"] = label
-        e["total_hours"]    += ts["total_hours"]
-        e["standard_hours"] += ts["standard_hours"]
-        e["weekday_ot"]     += ts["weekday_ot"]
-        e["saturday_hours"] += ts["saturday_hours"]
-        e["sunday_hours"]   += ts["sunday_hours"]
-        e["bh_hours"]       += ts["bh_hours"]
-        e["holiday_days"]   += ts["holiday_days"]
-        e["sick_days"]      += ts["sick_days"]
-        e["repairs_logged"]     += ts["repairs_logged"]
-        e["extra_jobs_logged"]  += ts["extra_jobs_logged"]
-
-    ws.merge_cells(f"A1:{get_column_letter(num_cols)}1")
-    c = ws.cell(row=1, column=1, value="Monthly Summary")
-    c.font = Font(name="Calibri", bold=True, size=16, color=WHITE)
-    c.fill = PatternFill(start_color=NAV, end_color=NAV, fill_type="solid")
-    c.alignment = Alignment(horizontal="center", vertical="center")
-    ws.row_dimensions[1].height = 32
-
-    current_row = 2
-    for month_idx, month_key in enumerate(sorted(monthly.keys())):
-        engineers = monthly[month_key]
-        first_eng = next(iter(engineers))
-        month_label = engineers[first_eng]["month_label"]
-
-        if month_idx > 0:
-            ws.row_dimensions[current_row].height = 10
-            current_row += 1
-
-        ws.merge_cells(f"A{current_row}:{get_column_letter(num_cols)}{current_row}")
-        mh = ws.cell(row=current_row, column=1, value=month_label)
-        mh.font = Font(name="Calibri", bold=True, size=12, color=WHITE)
-        mh.fill = PatternFill(start_color=MID, end_color=MID, fill_type="solid")
-        mh.alignment = Alignment(horizontal="left", vertical="center", indent=1)
-        mh.border = thin_border()
-        ws.row_dimensions[current_row].height = 26
-        current_row += 1
-
-        for col_idx, h in enumerate(col_headers, 1):
-            hdr_cell(ws, current_row, col_idx, h, bg="2E75B6", size=10)
-        ws.row_dimensions[current_row].height = 24
-        current_row += 1
-
-        totals = [0.0] * (num_cols - 1)
-        for eng_idx, eng_name in enumerate(sorted(engineers.keys())):
-            d = engineers[eng_name]
-            alt = (eng_idx % 2 == 0)
-            row_vals = [
-                eng_name,
-                d["weeks"],
-                round(d["total_hours"], 2),
-                round(d["standard_hours"], 2),
-                round(d["weekday_ot"], 2),
-                round(d["saturday_hours"], 2),
-                round(d["sunday_hours"], 2),
-                round(d["bh_hours"], 2),
-                d["holiday_days"],
-                d["sick_days"],
-                d["repairs_logged"],
-                d["extra_jobs_logged"],
-            ]
-            for col_idx, val in enumerate(row_vals, 1):
-                c = ws.cell(row=current_row, column=col_idx, value=val)
-                c.font = Font(name="Calibri", size=10, bold=(col_idx == 1))
-                c.fill = PatternFill(
-                    start_color=LIGHT if alt else WHITE,
-                    end_color=LIGHT if alt else WHITE, fill_type="solid")
-                c.alignment = Alignment(
-                    horizontal="left" if col_idx == 1 else "center", vertical="center")
-                c.border = thin_border()
-                if col_idx > 1:
-                    try:
-                        totals[col_idx - 2] += float(val or 0)
-                    except (TypeError, ValueError):
-                        pass
-            ws.row_dimensions[current_row].height = 18
-            current_row += 1
-
-        tc = ws.cell(row=current_row, column=1, value="TOTAL")
-        tc.font = Font(name="Calibri", bold=True, size=11, color=WHITE)
-        tc.fill = PatternFill(start_color=NAV, end_color=NAV, fill_type="solid")
-        tc.alignment = Alignment(horizontal="center", vertical="center")
-        tc.border = thin_border()
-        for col_idx, total_val in enumerate(totals, 2):
-            display = int(total_val) if total_val == int(total_val) else round(total_val, 2)
-            c = ws.cell(row=current_row, column=col_idx, value=display)
-            c.font = Font(name="Calibri", bold=True, size=11, color=WHITE)
-            c.fill = PatternFill(start_color=NAV, end_color=NAV, fill_type="solid")
-            c.alignment = Alignment(horizontal="center", vertical="center")
-            c.border = thin_border()
-        ws.row_dimensions[current_row].height = 22
-        current_row += 1
-
-    ws.freeze_panes = "A2"
-
-
-def _build_monthly_data(wb, timesheets):
-    from collections import defaultdict
-    ws = wb.create_sheet("MonthlyData")
-
-    headers = [
-        "Engineer", "Month", "Year", "Weeks",
-        "Total Hours", "Standard Hours (Mon-Fri)", "Weekday Overtime",
-        "Saturday Hours", "Sunday Hours", "Bank Holiday Hours",
-        "Holiday Days", "Sickness Days",
-        "Repairs Logged", "Extra Jobs Logged",
-    ]
-    col_widths = [28, 16, 8, 8, 13, 22, 16, 15, 13, 18, 13, 13, 14, 15]
-
-    for col_idx, (h, w) in enumerate(zip(headers, col_widths), 1):
-        hdr_cell(ws, 1, col_idx, h, size=10)
-        set_col_width(ws, get_column_letter(col_idx), w)
-    ws.row_dimensions[1].height = 22
-
-    monthly = defaultdict(lambda: defaultdict(lambda: {
-        "weeks": 0, "month_label": "", "year": 0, "month_num": 0,
-        "total_hours": 0.0, "standard_hours": 0.0, "weekday_ot": 0.0,
-        "saturday_hours": 0.0, "sunday_hours": 0.0, "bh_hours": 0.0,
-        "holiday_days": 0, "sick_days": 0,
-        "repairs_logged": 0, "extra_jobs_logged": 0,
-    }))
-
-    for ts in timesheets:
-        wc_date = _parse_wc_date(ts["week_commencing_str"])
-        if wc_date:
-            key = (wc_date.year, wc_date.month)
-            label = wc_date.strftime("%B")
-            year = wc_date.year
-        else:
-            key = (9999, 99)
-            label = "Unknown"
-            year = 0
-        e = monthly[key][ts["engineer_name"]]
-        e["weeks"] += 1
-        e["month_label"] = label
-        e["year"] = year
-        e["month_num"] = key[1]
-        e["total_hours"]    += ts["total_hours"]
-        e["standard_hours"] += ts["standard_hours"]
-        e["weekday_ot"]     += ts["weekday_ot"]
-        e["saturday_hours"] += ts["saturday_hours"]
-        e["sunday_hours"]   += ts["sunday_hours"]
-        e["bh_hours"]       += ts["bh_hours"]
-        e["holiday_days"]   += ts["holiday_days"]
-        e["sick_days"]      += ts["sick_days"]
-        e["repairs_logged"]     += ts["repairs_logged"]
-        e["extra_jobs_logged"]  += ts["extra_jobs_logged"]
-
-    row_idx = 2
-    for month_key in sorted(monthly.keys()):
-        for eng_name in sorted(monthly[month_key].keys()):
-            d = monthly[month_key][eng_name]
-            alt = (row_idx % 2 == 0)
-            row_vals = [
-                eng_name,
-                d["month_label"],
-                d["year"] if d["year"] else "",
-                d["weeks"],
-                round(d["total_hours"], 2),
-                round(d["standard_hours"], 2),
-                round(d["weekday_ot"], 2),
-                round(d["saturday_hours"], 2),
-                round(d["sunday_hours"], 2),
-                round(d["bh_hours"], 2),
-                d["holiday_days"],
-                d["sick_days"],
-                d["repairs_logged"],
-                d["extra_jobs_logged"],
-            ]
-            for col_idx, val in enumerate(row_vals, 1):
-                data_cell(ws, row_idx, col_idx, val, alt=alt)
-            ws.row_dimensions[row_idx].height = 18
-            row_idx += 1
-
-    ws.freeze_panes = "A2"
-    ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}1"
-
-
-def _build_payroll_sheet(wb, timesheets):
-    """Payroll sheet matching the Overtime_Payroll template format.
-    Rows = engineers. Columns = one 3-sub-column block per week (1.5x OT | 1.5 Sat | Double)
-    plus bonus/sick columns on the right.
-    """
-    from collections import defaultdict
-    ws = wb.create_sheet("Payroll")
-    ws.sheet_view.showGridLines = False
-
-    # Sorted unique weeks
-    week_date_map = {}
-    for ts in timesheets:
-        wc = ts["week_commencing_str"]
-        if wc not in week_date_map:
-            week_date_map[wc] = _parse_wc_date(wc)
-    week_keys = sorted(week_date_map, key=lambda w: week_date_map[w] or datetime.date.max)
-
-    n_weeks = len(week_keys)
-    bonus_labels = [
-        "£50 Bonus", "£10 Repairs Bonus", "£50 On-Call Bonus",
-        "£20 Elec/Gas Bonus", "£0.13 Private Miles",
-        "Sick Days", "Unpaid Leave Days", "Comments",
-    ]
-    bonus_start = 3 + n_weeks * 3      # first bonus column (1-indexed)
-    total_cols  = bonus_start - 1 + len(bonus_labels)
-
-    # --- Style helpers ---
-    def phdr(row, col, value, bold=True, center=True):
-        c = ws.cell(row=row, column=col, value=value)
-        c.font = Font(name="Calibri", bold=bold, color=WHITE, size=10)
-        c.fill = PatternFill(start_color=PAY_NAVY, end_color=PAY_NAVY, fill_type="solid")
-        c.alignment = Alignment(horizontal="center" if center else "left",
-                                vertical="center", wrap_text=True)
-        c.border = thin_border()
-        return c
-
-    def pdata(row, col, value, navy=False, bold=False, center=True):
-        c = ws.cell(row=row, column=col, value=value)
-        c.font = Font(name="Calibri", bold=bold, size=10,
-                      color=WHITE if navy else "000000")
-        if navy:
-            c.fill = PatternFill(start_color=PAY_NAVY, end_color=PAY_NAVY, fill_type="solid")
-        c.alignment = Alignment(horizontal="center" if center else "left",
-                                vertical="center")
-        c.border = thin_border()
-        return c
-
-    # --- Row 1 & 2: headers ---
-    # Name and Payroll No. — merged vertically rows 1-2
-    phdr(1, 1, "Name", center=False)
-    phdr(1, 2, "Payroll No.")
-    ws.merge_cells(start_row=1, start_column=1, end_row=2, end_column=1)
-    ws.merge_cells(start_row=1, start_column=2, end_row=2, end_column=2)
-
-    for w_idx, wc in enumerate(week_keys):
-        col = 3 + w_idx * 3
-        wc_date = week_date_map[wc]
-        label = wc_date if wc_date else wc
-        ws.merge_cells(start_row=1, start_column=col, end_row=1, end_column=col + 2)
-        c = phdr(1, col, label)
-        if wc_date:
-            c.number_format = "DD/MM/YYYY"
-        phdr(2, col,     "1.5",      bold=False)
-        phdr(2, col + 1, "1.5 Sat",  bold=False)
-        phdr(2, col + 2, "Double",   bold=False)
-
-    for b_idx, label in enumerate(bonus_labels):
-        col = bonus_start + b_idx
-        ws.merge_cells(start_row=1, start_column=col, end_row=2, end_column=col)
-        phdr(1, col, label, bold=False)
-
-    ws.row_dimensions[1].height = 24
-    ws.row_dimensions[2].height = 20
-    ws.row_dimensions[3].height = 6   # blank spacer row
-
-    # --- Build engineer lookup ---
-    engineers = {}
-    for ts in timesheets:
-        eng = ts["engineer_name"]
-        engineers.setdefault(eng, {})[ts["week_commencing_str"]] = ts
-
-    sick_col = bonus_start + 5   # "Sick Days" = 6th bonus column
-
-    totals = defaultdict(float)
-    data_start_row = 4
-
-    for eng_idx, eng_name in enumerate(engineers, data_start_row):
-        week_data = engineers[eng_name]
-        pdata(eng_idx, 1, eng_name, center=False)
-        pdata(eng_idx, 2, None)   # Payroll No. — left blank for user to fill
-
-        sick_total = 0
-        for w_idx, wc in enumerate(week_keys):
-            col = 3 + w_idx * 3
-            if wc in week_data:
-                ts = week_data[wc]
-                ot  = ts["weekday_ot"]      or None
-                sat = ts["saturday_hours"]  or None
-                dbl = (ts["sunday_hours"] + ts["bh_hours"]) or None
-                pdata(eng_idx, col,     ot)
-                pdata(eng_idx, col + 1, sat)
-                pdata(eng_idx, col + 2, dbl)
-                if ot:  totals[col]     += ot
-                if sat: totals[col + 1] += sat
-                if dbl: totals[col + 2] += dbl
-                sick_total += ts["sick_days"]
-
-        sick_val = sick_total if sick_total else None
-        pdata(eng_idx, sick_col, sick_val)
-        if sick_val:
-            totals[sick_col] += sick_val
-        ws.row_dimensions[eng_idx].height = 18
-
-    # --- Total row ---
-    total_row = data_start_row + len(engineers)
-    pdata(total_row, 1, "TOTAL", navy=True, bold=True, center=False)
-    for col in range(2, total_cols + 1):
-        val = totals.get(col)
-        if val is not None:
-            display = int(val) if val == int(val) else round(val, 2)
-            pdata(total_row, col, display, navy=True, bold=True)
-        else:
-            c = ws.cell(row=total_row, column=col)
-            c.fill = PatternFill(start_color=PAY_NAVY, end_color=PAY_NAVY, fill_type="solid")
-            c.border = thin_border()
-    ws.row_dimensions[total_row].height = 22
-
-    # --- Column widths ---
-    set_col_width(ws, "A", 28)
-    set_col_width(ws, "B", 12)
-    for w_idx in range(n_weeks):
-        col = 3 + w_idx * 3
-        for offset in range(3):
-            set_col_width(ws, get_column_letter(col + offset), 9)
-    for b_idx in range(len(bonus_labels)):
-        set_col_width(ws, get_column_letter(bonus_start + b_idx), 14)
-
-    ws.freeze_panes = f"{get_column_letter(3)}4"
-
-
-def _build_weekly_data(wb, timesheets):
-    ws = wb.create_sheet("WeeklyData")
-
-    headers = [
-        "Engineer", "Week Commencing", "Total Hours", "Standard Hours (Mon-Fri)",
-        "Weekday Overtime", "Saturday Hours", "Sunday Hours", "Bank Holiday Hours",
-        "Holiday Days", "Sickness Days", "Repairs Logged", "Repairs Notes",
-        "Extra Jobs Logged", "Extra Jobs Notes", "Source File", "Key (Engineer|Serial)"
-    ]
-    col_widths = [28, 18, 13, 22, 16, 15, 13, 18, 13, 13, 14, 30, 15, 30, 36, 30]
-
-    for col_idx, (h, w) in enumerate(zip(headers, col_widths), 1):
-        hdr_cell(ws, 1, col_idx, h, size=10)
-        set_col_width(ws, get_column_letter(col_idx), w)
-    ws.row_dimensions[1].height = 22
-
-    for row_idx, ts in enumerate(timesheets, 2):
-        wc = ts["week_commencing_str"]
-        try:
-            wc_date = datetime.date.fromisoformat(wc)
-        except Exception:
-            wc_date = None
-
-        serial = to_excel_serial(wc_date) if wc_date else ""
-        key = f"{ts['engineer_name']}|{serial}" if serial else ""
-        alt = (row_idx % 2 == 0)
-
-        row_values = [
-            ts["engineer_name"],
-            wc_date,
-            ts["total_hours"],
-            ts["standard_hours"],
-            ts["weekday_ot"],
-            ts["saturday_hours"],
-            ts["sunday_hours"],
-            ts["bh_hours"],
-            ts["holiday_days"],
-            ts["sick_days"],
-            ts["repairs_logged"],
-            ts["repairs_notes"],
-            ts["extra_jobs_logged"],
-            ts["extra_jobs_notes"],
-            ts.get("source_file", ""),
-            key,
-        ]
-
-        for col_idx, val in enumerate(row_values, 1):
-            c = data_cell(ws, row_idx, col_idx, val, alt=alt,
-                          wrap=(col_idx in (12, 14)))
-            if col_idx == 2 and wc_date:
-                c.number_format = "YYYY-MM-DD"
-
-        ws.row_dimensions[row_idx].height = 18
-
-    ws.freeze_panes = "A2"
-    ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}1"
-
-
-def _build_daily_data(wb, timesheets):
-    ws = wb.create_sheet("DailyData")
-
-    headers = [
-        "Engineer", "Week Commencing", "Date", "Day",
-        "Start Time", "End Time", "Total Hours",
-        "Bank Holiday", "Holiday", "Sickness", "Source File"
-    ]
-    col_widths = [28, 18, 13, 12, 11, 11, 13, 14, 10, 10, 36]
-
-    for col_idx, (h, w) in enumerate(zip(headers, col_widths), 1):
-        hdr_cell(ws, 1, col_idx, h, size=10)
-        set_col_width(ws, get_column_letter(col_idx), w)
-    ws.row_dimensions[1].height = 22
-
-    row_idx = 2
-    for ts in timesheets:
-        daily_df = ts["daily_df"]
-        wc = ts["week_commencing_str"]
-        engineer = ts["engineer_name"]
-        source = ts.get("source_file", "")
-
-        for _, day_row in daily_df.iterrows():
-            alt = (row_idx % 2 == 0)
-            date_val = str(day_row.get("Date", "")).strip()
-            try:
-                date_obj = datetime.date.fromisoformat(date_val)
-            except Exception:
-                date_obj = date_val
-
-            row_values = [
-                engineer,
-                wc,
-                date_obj,
-                str(day_row.get("Day", "")).strip(),
-                str(day_row.get("Start Time", "")).strip(),
-                str(day_row.get("End Time", "")).strip(),
-                day_row.get("Total Hours", 0),
-                str(day_row.get("Bank Holiday", "")).strip(),
-                str(day_row.get("Holiday", "")).strip(),
-                str(day_row.get("Sickness", "")).strip(),
-                source,
-            ]
-
-            for col_idx, val in enumerate(row_values, 1):
-                c = data_cell(ws, row_idx, col_idx, val, alt=alt)
-                if col_idx == 3 and isinstance(date_obj, datetime.date):
-                    c.number_format = "YYYY-MM-DD"
-
-            ws.row_dimensions[row_idx].height = 16
-            row_idx += 1
-
-    ws.freeze_panes = "A2"
-    ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}1"
 
 
 # ── UI ────────────────────────────────────────────────────────────────────────
 
 uploaded_files = st.file_uploader(
-    "Select timesheet CSV files",
+    "Upload SOSengitrack weekly timesheet CSV files",
     type=["csv"],
     accept_multiple_files=True,
-    help="Select all your EngiTrack CSV timesheets — up to 100 weeks per engineer, any number of engineers"
+    help="Upload one or more SOSengitrack weekly CSV exports — any number of engineers or weeks.",
 )
 
 if uploaded_files:
-
     timesheets = []
-    sheet_errors = []
-    seen_names = {}
+    errors = []
 
     for f in uploaded_files:
         try:
-            ts = parse_engitrack_csv(f)
-            ts["source_file"] = f.name
-
-            base = sanitise_sheet_name(ts["engineer_name"])
-            if base in seen_names:
-                seen_names[base] += 1
-                ts["sheet_name"] = sanitise_sheet_name(f"{ts['engineer_name']} ({seen_names[base]})")
+            f.seek(0)
+            ts = parse_csv(f)
+            if not ts["engineer"]:
+                errors.append(f"{f.name}: Could not find engineer name — is this a SOSengitrack CSV?")
             else:
-                seen_names[base] = 1
-                ts["sheet_name"] = base
+                timesheets.append(ts)
+        except Exception as exc:
+            errors.append(f"{f.name}: {exc}")
 
-            timesheets.append(ts)
-        except Exception as e:
-            sheet_errors.append((f.name, str(e)))
-
-    for fname, err in sheet_errors:
-        st.warning(f"Could not read **{fname}**: {err}")
+    for err in errors:
+        st.error(err)
 
     if timesheets:
-        st.success(f"{len(timesheets)} timesheet(s) loaded.")
-        st.subheader("Preview")
+        engineers = sorted(set(ts["engineer"] for ts in timesheets))
+        weeks = sorted(set(ts["week_str"] for ts in timesheets))
 
-        tab_labels = [ts["engineer_name"] for ts in timesheets]
-        tabs = st.tabs(tab_labels)
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Files loaded", len(timesheets))
+        col2.metric("Engineers", len(engineers))
+        col3.metric("Weeks", len(weeks))
 
-        for tab, ts in zip(tabs, timesheets):
-            with tab:
-                wc = ts["week_commencing_str"]
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Total Hours", ts["total_hours"])
-                c2.metric("Standard Hours", ts["standard_hours"])
-                c3.metric("Weekday OT", ts["weekday_ot"])
-                c4.metric("Week Commencing", wc)
-                c5, c6, c7, c8 = st.columns(4)
-                c5.metric("Sat Hours", ts["saturday_hours"])
-                c6.metric("Sun Hours", ts["sunday_hours"])
-                c7.metric("Holiday Days", ts["holiday_days"])
-                c8.metric("Sick Days", ts["sick_days"])
-                st.dataframe(ts["daily_df"], use_container_width=True, height=260)
+        with st.expander("Preview loaded timesheets"):
+            for ts in sorted(timesheets, key=lambda t: (t["engineer"].lower(), t["week_str"])):
+                st.markdown(
+                    f"**{ts['engineer']}** · week of {ts['week_str']} · "
+                    f"{ts['total_hours']}h total, {ts['weekday_ot']}h OT, "
+                    f"{ts['bh_hours']}h BH, {ts['sick_days']} sick day(s)"
+                )
 
         st.divider()
 
-        col1, col2 = st.columns([2, 1])
-        with col1:
-            workbook_name = st.text_input(
-                "Output workbook filename",
-                value="EngiTrack_Combined",
-                help="Name for the downloaded Excel workbook (no extension needed)"
-            )
+        if st.button("Combine into Excel Workbook", type="primary"):
+            wb = build_excel(timesheets)
+            buf = io.BytesIO()
+            wb.save(buf)
+            st.session_state["excel_bytes"] = buf.getvalue()
 
-        current_file_key = tuple(sorted(f.name for f in uploaded_files))
-        if st.session_state.get("_wb_file_key") != current_file_key:
-            st.session_state.pop("_wb_bytes", None)
-            st.session_state.pop("_wb_filename", None)
-            st.session_state["_wb_file_key"] = current_file_key
+        if st.session_state.get("excel_bytes"):
+            excel_bytes = st.session_state["excel_bytes"]
+            fname = "timesheets_combined.xlsx"
 
-        if st.button("Combine into Excel Workbook", type="primary", use_container_width=True):
-            with st.spinner("Building workbook..."):
-                wb = build_workbook(timesheets)
-                buffer = io.BytesIO()
-                wb.save(buffer)
-                safe_name = workbook_name.strip().replace(" ", "_") or "EngiTrack_Combined"
-                st.session_state["_wb_bytes"] = buffer.getvalue()
-                st.session_state["_wb_filename"] = f"{safe_name}.xlsx"
-
-        if "_wb_bytes" in st.session_state:
-            wb_bytes = st.session_state["_wb_bytes"]
-            fname = st.session_state["_wb_filename"]
-
+            # Windows exe — save directly to Downloads folder
             if getattr(sys, "frozen", False):
-                downloads_dir = Path.home() / "Downloads"
-                downloads_dir.mkdir(parents=True, exist_ok=True)
-                output_path = downloads_dir / fname
-                output_path.write_bytes(wb_bytes)
-                st.success(
-                    f"Workbook saved to your Downloads folder:\n\n"
-                    f"**{output_path}**"
-                )
-                if st.button("Open file location", key="open_folder"):
-                    subprocess.Popen(
-                        ["explorer", "/select,", str(output_path)]
-                    )
+                downloads = Path.home() / "Downloads" / fname
+                downloads.write_bytes(excel_bytes)
+                st.success(f"Saved to {downloads}")
+                if st.button("Open file location"):
+                    subprocess.Popen(f'explorer /select,"{downloads}"')
             else:
-                b64 = base64.b64encode(wb_bytes).decode()
-                mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                b64 = base64.b64encode(excel_bytes).decode()
                 st.markdown(
-                    f"""
-                    <a href="data:{mime};base64,{b64}" download="{fname}"
-                       style="display:block;width:100%;padding:0.6rem 1rem;
-                              background:#FF4B4B;color:white;text-align:center;
-                              font-weight:600;font-size:1rem;border-radius:0.5rem;
-                              text-decoration:none;">
-                        ⬇ Download {fname}
-                    </a>
-                    """,
+                    f'<a href="data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,{b64}" '
+                    f'download="{fname}" style="font-size:1.1em;font-weight:600;">⬇ Download Combined Workbook</a>',
                     unsafe_allow_html=True,
                 )
                 st.success(
-                    f"Workbook ready — {len(timesheets)} engineer(s) across 9 sheets: "
-                    f"Instructions · Engineer_List · Week_List · **Payroll** · Weekly_Summary · Monthly_Summary · WeeklyData · MonthlyData · DailyData"
+                    f"Workbook ready — {len(timesheets)} timesheet(s), 2 sheets: **Weekly** · **Monthly**"
+                )
+                st.caption(
+                    "If the download link doesn't work, open this page in a new browser tab "
+                    "(not the embedded preview)."
                 )
 
 else:
-    st.info("Upload your EngiTrack CSV timesheet files above to get started.")
+    st.info("Upload SOSengitrack weekly timesheet CSV files above to get started.")
     st.markdown("""
-    **How it works:**
-    1. Upload your EngiTrack CSV files (up to 100 weeks per engineer, any number of engineers)
-    2. Check the preview — each tab shows an engineer's hours summary and daily breakdown
-    3. Click **Combine into Excel Workbook** to generate the workbook
-    4. Open **Weekly_Summary** in the downloaded file and pick any week to see all engineers at a glance
-
-    **Output sheets:**  Instructions · Engineer_List · Week_List · **Payroll** · Weekly_Summary · Monthly_Summary · WeeklyData · MonthlyData · DailyData
-    """)
+**How to use:**
+1. Export each engineer's weekly timesheet from SOSengitrack as a CSV
+2. Upload all files at once (any number of engineers, any number of weeks)
+3. Click **Combine into Excel Workbook**
+4. Download the file — it contains:
+   - **Weekly** sheet: one row per engineer per week with all hour totals
+   - **Monthly** sheet: the same data rolled up by calendar month
+""")
