@@ -43,8 +43,15 @@ def _parse_date(s):
     return None
 
 
+_WEEKDAYS = {"Monday", "Tuesday", "Wednesday", "Thursday", "Friday"}
+
+
 def parse_csv(file_obj):
-    """Parse a SOSengitrack weekly timesheet CSV and return a data dict."""
+    """Parse a SOSengitrack weekly timesheet CSV and return a data dict.
+
+    Weekday OT is recalculated from daily rows as max(0, hours - 9) per
+    weekday (Mon–Fri, excluding Bank Holiday days), overriding the CSV total.
+    """
     raw = file_obj.read()
     if isinstance(raw, bytes):
         raw = raw.decode("utf-8-sig")
@@ -64,6 +71,9 @@ def parse_csv(file_obj):
         "repairs": 0,
         "extra_jobs": 0,
     }
+
+    # Collect per-day records for OT recalculation
+    daily_rows = []   # list of (day_name, hours, is_bh, is_sick)
 
     in_daily = False
     in_totals = False
@@ -94,15 +104,24 @@ def parse_csv(file_obj):
             in_daily = False
             continue
 
-        # Daily data rows — count sick days
+        # Daily data rows
+        # Columns: Date,Day,Start,End,Total Hours,Bank Holiday,Holiday,Sickness,Weekend Worked
         if in_daily:
             parts = s.split(",")
-            # Date,Day,Start,End,Total,BankHol,Holiday,Sickness,WeekendWorked
-            if len(parts) >= 8 and parts[7].strip().lower() == "yes":
-                data["sick_days"] += 1
+            if len(parts) >= 8:
+                day_name  = parts[1].strip()
+                try:
+                    hours = float(parts[4].strip()) if parts[4].strip() else 0.0
+                except ValueError:
+                    hours = 0.0
+                is_bh   = parts[5].strip().lower() == "yes"
+                is_sick = parts[7].strip().lower() == "yes"
+                daily_rows.append((day_name, hours, is_bh, is_sick))
+                if is_sick:
+                    data["sick_days"] += 1
             continue
 
-        # Weekly totals / repair / extra jobs section
+        # Weekly totals / repairs / extra jobs
         if "," in s:
             key, val = s.split(",", 1)
             key = key.strip()
@@ -115,8 +134,6 @@ def parse_csv(file_obj):
                 data["total_hours"] = v
             elif "Standard Hours" in key:
                 data["standard_hours"] = v
-            elif key == "Weekday Overtime":
-                data["weekday_ot"] = v
             elif key == "Saturday Hours":
                 data["saturday_hours"] = v
             elif key == "Sunday Hours":
@@ -127,6 +144,16 @@ def parse_csv(file_obj):
                 data["repairs"] = int(v)
             elif key == "Extra Jobs Logged":
                 data["extra_jobs"] = int(v)
+            # "Weekday Overtime" from CSV is intentionally ignored —
+            # we recalculate it below.
+
+    # ── Recalculate weekday OT: OT starts after 9 h on Mon–Fri non-BH days ──
+    weekday_ot = sum(
+        max(0.0, hours - 9.0)
+        for day_name, hours, is_bh, is_sick in daily_rows
+        if day_name in _WEEKDAYS and not is_bh
+    )
+    data["weekday_ot"] = round(weekday_ot, 2)
 
     return data
 
