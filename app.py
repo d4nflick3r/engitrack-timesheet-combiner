@@ -150,19 +150,22 @@ def parse_csv(file_obj):
     # ── Recalculate weekday OT ────────────────────────────────────────────────
     # Rules (both must be satisfied):
     #   1. A day must exceed 9 h before any OT is counted for that day.
-    #   2. Salary covers 40 h/week — OT is only recorded once 40 h are reached.
+    #   2. Salary covers 40 h/week, reduced by 8 h per bank holiday day
+    #      (BH days are paid through salary so they lower the weekly threshold).
     #
-    # Method: standard hours = min(daily, 9) per weekday (non-BH).
-    # Any salary bandwidth unused by standard hours (40 − standard_hours)
-    # absorbs the first N hours of per-day OT before OT is recorded.
+    # Method: standard hours = min(daily, 9) per non-BH weekday.
+    # Salary threshold = 40 − (number of BH weekdays × 8).
+    # Any unused salary bandwidth absorbs per-day OT before OT is recorded.
     weekday_rows = [
         (hours, is_bh)
         for day_name, hours, is_bh, is_sick in daily_rows
         if day_name in _WEEKDAYS
     ]
+    bh_day_count   = sum(1 for h, is_bh in weekday_rows if is_bh)
+    salary_threshold = max(0.0, 40.0 - bh_day_count * 9.0)
     standard_hours = sum(min(h, 9.0) for h, is_bh in weekday_rows if not is_bh)
     per_day_ot     = sum(max(0.0, h - 9.0) for h, is_bh in weekday_rows if not is_bh)
-    salary_deficit = max(0.0, 40.0 - standard_hours)   # unused salary bandwidth
+    salary_deficit = max(0.0, salary_threshold - standard_hours)
     data["weekday_ot"] = round(max(0.0, per_day_ot - salary_deficit), 2)
 
     return data
