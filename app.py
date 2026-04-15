@@ -196,6 +196,7 @@ LIGHT = "D6E4F0"   # light blue row alt
 WHITE = "FFFFFF"
 GOLD  = "FFD700"
 GREY  = "F2F2F2"
+PAY_NAVY = "002060"  # payroll sheet header colour (matches template)
 
 def hdr_cell(ws, row, col, value, bg=NAV, fg=WHITE, bold=True, center=True, size=11):
     c = ws.cell(row=row, column=col, value=value)
@@ -237,6 +238,7 @@ def build_workbook(timesheets):
     _build_instructions(wb)
     _build_engineer_list(wb, timesheets)
     _build_week_list(wb, timesheets)
+    _build_payroll_sheet(wb, timesheets)
     _build_weekly_summary(wb, timesheets)
     _build_monthly_summary(wb, timesheets)
     _build_weekly_data(wb, timesheets)
@@ -256,8 +258,9 @@ def _build_instructions(wb):
         ("How to use", True, 12, MID, WHITE),
         ("1)  Upload your EngiTrack weekly CSV exports in the app above.", False, 11, GREY, "000000"),
         ("2)  Click Combine — the workbook is generated automatically.", False, 11, WHITE, "000000"),
-        ("3)  Open Weekly_Summary or Monthly_Summary for totals by week or month.", False, 11, GREY, "000000"),
-        ("4)  WeeklyData, MonthlyData and DailyData hold raw row-level data for deeper analysis.", False, 11, WHITE, "000000"),
+        ("3)  Open the Payroll sheet for a ready-to-submit payroll table (1.5× OT | Sat 1.5 | Double per week, sick days auto-filled — add payroll numbers and bonuses manually).", False, 11, GREY, "000000"),
+        ("4)  Open Weekly_Summary or Monthly_Summary for totals by week or month.", False, 11, WHITE, "000000"),
+        ("5)  WeeklyData, MonthlyData and DailyData hold raw row-level data for deeper analysis.", False, 11, GREY, "000000"),
         ("", False, 11, WHITE, "000000"),
         ("Notes", True, 12, MID, WHITE),
         ("•  Weekly_Summary groups engineers by week commencing date with column totals.", False, 11, GREY, "000000"),
@@ -661,6 +664,146 @@ def _build_monthly_data(wb, timesheets):
     ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}1"
 
 
+def _build_payroll_sheet(wb, timesheets):
+    """Payroll sheet matching the Overtime_Payroll template format.
+    Rows = engineers. Columns = one 3-sub-column block per week (1.5x OT | 1.5 Sat | Double)
+    plus bonus/sick columns on the right.
+    """
+    from collections import defaultdict
+    ws = wb.create_sheet("Payroll")
+    ws.sheet_view.showGridLines = False
+
+    # Sorted unique weeks
+    week_date_map = {}
+    for ts in timesheets:
+        wc = ts["week_commencing_str"]
+        if wc not in week_date_map:
+            week_date_map[wc] = _parse_wc_date(wc)
+    week_keys = sorted(week_date_map, key=lambda w: week_date_map[w] or datetime.date.max)
+
+    n_weeks = len(week_keys)
+    bonus_labels = [
+        "£50 Bonus", "£10 Repairs Bonus", "£50 On-Call Bonus",
+        "£20 Elec/Gas Bonus", "£0.13 Private Miles",
+        "Sick Days", "Unpaid Leave Days", "Comments",
+    ]
+    bonus_start = 3 + n_weeks * 3      # first bonus column (1-indexed)
+    total_cols  = bonus_start - 1 + len(bonus_labels)
+
+    # --- Style helpers ---
+    def phdr(row, col, value, bold=True, center=True):
+        c = ws.cell(row=row, column=col, value=value)
+        c.font = Font(name="Calibri", bold=bold, color=WHITE, size=10)
+        c.fill = PatternFill(start_color=PAY_NAVY, end_color=PAY_NAVY, fill_type="solid")
+        c.alignment = Alignment(horizontal="center" if center else "left",
+                                vertical="center", wrap_text=True)
+        c.border = thin_border()
+        return c
+
+    def pdata(row, col, value, navy=False, bold=False, center=True):
+        c = ws.cell(row=row, column=col, value=value)
+        c.font = Font(name="Calibri", bold=bold, size=10,
+                      color=WHITE if navy else "000000")
+        if navy:
+            c.fill = PatternFill(start_color=PAY_NAVY, end_color=PAY_NAVY, fill_type="solid")
+        c.alignment = Alignment(horizontal="center" if center else "left",
+                                vertical="center")
+        c.border = thin_border()
+        return c
+
+    # --- Row 1 & 2: headers ---
+    # Name and Payroll No. — merged vertically rows 1-2
+    phdr(1, 1, "Name", center=False)
+    phdr(1, 2, "Payroll No.")
+    ws.merge_cells(start_row=1, start_column=1, end_row=2, end_column=1)
+    ws.merge_cells(start_row=1, start_column=2, end_row=2, end_column=2)
+
+    for w_idx, wc in enumerate(week_keys):
+        col = 3 + w_idx * 3
+        wc_date = week_date_map[wc]
+        label = wc_date if wc_date else wc
+        ws.merge_cells(start_row=1, start_column=col, end_row=1, end_column=col + 2)
+        c = phdr(1, col, label)
+        if wc_date:
+            c.number_format = "DD/MM/YYYY"
+        phdr(2, col,     "1.5",      bold=False)
+        phdr(2, col + 1, "1.5 Sat",  bold=False)
+        phdr(2, col + 2, "Double",   bold=False)
+
+    for b_idx, label in enumerate(bonus_labels):
+        col = bonus_start + b_idx
+        ws.merge_cells(start_row=1, start_column=col, end_row=2, end_column=col)
+        phdr(1, col, label, bold=False)
+
+    ws.row_dimensions[1].height = 24
+    ws.row_dimensions[2].height = 20
+    ws.row_dimensions[3].height = 6   # blank spacer row
+
+    # --- Build engineer lookup ---
+    engineers = {}
+    for ts in timesheets:
+        eng = ts["engineer_name"]
+        engineers.setdefault(eng, {})[ts["week_commencing_str"]] = ts
+
+    sick_col = bonus_start + 5   # "Sick Days" = 6th bonus column
+
+    totals = defaultdict(float)
+    data_start_row = 4
+
+    for eng_idx, eng_name in enumerate(engineers, data_start_row):
+        week_data = engineers[eng_name]
+        pdata(eng_idx, 1, eng_name, center=False)
+        pdata(eng_idx, 2, None)   # Payroll No. — left blank for user to fill
+
+        sick_total = 0
+        for w_idx, wc in enumerate(week_keys):
+            col = 3 + w_idx * 3
+            if wc in week_data:
+                ts = week_data[wc]
+                ot  = ts["weekday_ot"]      or None
+                sat = ts["saturday_hours"]  or None
+                dbl = (ts["sunday_hours"] + ts["bh_hours"]) or None
+                pdata(eng_idx, col,     ot)
+                pdata(eng_idx, col + 1, sat)
+                pdata(eng_idx, col + 2, dbl)
+                if ot:  totals[col]     += ot
+                if sat: totals[col + 1] += sat
+                if dbl: totals[col + 2] += dbl
+                sick_total += ts["sick_days"]
+
+        sick_val = sick_total if sick_total else None
+        pdata(eng_idx, sick_col, sick_val)
+        if sick_val:
+            totals[sick_col] += sick_val
+        ws.row_dimensions[eng_idx].height = 18
+
+    # --- Total row ---
+    total_row = data_start_row + len(engineers)
+    pdata(total_row, 1, "TOTAL", navy=True, bold=True, center=False)
+    for col in range(2, total_cols + 1):
+        val = totals.get(col)
+        if val is not None:
+            display = int(val) if val == int(val) else round(val, 2)
+            pdata(total_row, col, display, navy=True, bold=True)
+        else:
+            c = ws.cell(row=total_row, column=col)
+            c.fill = PatternFill(start_color=PAY_NAVY, end_color=PAY_NAVY, fill_type="solid")
+            c.border = thin_border()
+    ws.row_dimensions[total_row].height = 22
+
+    # --- Column widths ---
+    set_col_width(ws, "A", 28)
+    set_col_width(ws, "B", 12)
+    for w_idx in range(n_weeks):
+        col = 3 + w_idx * 3
+        for offset in range(3):
+            set_col_width(ws, get_column_letter(col + offset), 9)
+    for b_idx in range(len(bonus_labels)):
+        set_col_width(ws, get_column_letter(bonus_start + b_idx), 14)
+
+    ws.freeze_panes = f"{get_column_letter(3)}4"
+
+
 def _build_weekly_data(wb, timesheets):
     ws = wb.create_sheet("WeeklyData")
 
@@ -890,8 +1033,8 @@ if uploaded_files:
                     unsafe_allow_html=True,
                 )
                 st.success(
-                    f"Workbook ready — {len(timesheets)} engineer(s) across 8 sheets: "
-                    f"Instructions · Engineer_List · Week_List · Weekly_Summary · Monthly_Summary · WeeklyData · MonthlyData · DailyData"
+                    f"Workbook ready — {len(timesheets)} engineer(s) across 9 sheets: "
+                    f"Instructions · Engineer_List · Week_List · **Payroll** · Weekly_Summary · Monthly_Summary · WeeklyData · MonthlyData · DailyData"
                 )
 
 else:
@@ -903,5 +1046,5 @@ else:
     3. Click **Combine into Excel Workbook** to generate the workbook
     4. Open **Weekly_Summary** in the downloaded file and pick any week to see all engineers at a glance
 
-    **Output sheets:**  Instructions · Engineer_List · Week_List · Weekly_Summary · Monthly_Summary · WeeklyData · MonthlyData · DailyData
+    **Output sheets:**  Instructions · Engineer_List · Week_List · **Payroll** · Weekly_Summary · Monthly_Summary · WeeklyData · MonthlyData · DailyData
     """)
