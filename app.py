@@ -370,11 +370,19 @@ if uploaded_files:
 
             # Windows exe — save directly to Downloads folder
             if getattr(sys, "frozen", False):
-                downloads = Path.home() / "Downloads" / fname
-                downloads.write_bytes(excel_bytes)
-                st.success(f"Saved to {downloads}")
-                if st.button("Open file location"):
-                    subprocess.Popen(f'explorer /select,"{downloads}"')
+                ts_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                unique_fname = f"timesheets_combined_{ts_str}.xlsx"
+                downloads = Path.home() / "Downloads" / unique_fname
+                try:
+                    downloads.write_bytes(excel_bytes)
+                    st.success(f"Saved to {downloads}")
+                    if st.button("Open file location"):
+                        subprocess.Popen(f'explorer /select,"{downloads}"')
+                except PermissionError:
+                    st.error(
+                        f"Could not save to Downloads — close any open copy of the file in Excel and try again.\n\n"
+                        f"Attempted path: {downloads}"
+                    )
             else:
                 b64 = base64.b64encode(excel_bytes).decode()
                 st.markdown(
